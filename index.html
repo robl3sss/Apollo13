@@ -90,6 +90,9 @@
   <div id="loading" role="status"><div class="loader" aria-hidden="true"></div><h2 id="loadingTitle">APOLLO 13</h2><p id="loadingText">Preparando el simulador 3D…</p><button id="reloadBtn" class="btn primary" type="button" hidden>Reintentar</button></div>
 </main>
 <noscript>Activa JavaScript para usar el simulador 3D de Apollo 13.</noscript>
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.180.0/+esm"}}
+</script>
 <script type="module">
 let THREE;
 try {
@@ -756,6 +759,89 @@ function baselineTelemetryAt(stageIndex,progress,out){
 }
 function targetTelemetry(out){return baselineTelemetryAt(mission.stage,mission.progress,out);}
 const telemetryTarget={speed:0,earth:0,moon:0,o2:0,power:0,co2:0,temp:0,integrity:0,travel:0};
+
+// ---------- SUPPLIED SATURN V MODEL ----------
+// Preserve the supplied 3DS geometry and PNG textures. Only its up axis,
+// overall scale and stage ownership change to fit the animated mission.
+async function installSuppliedSaturn(){
+  const {TDSLoader}=await import('./assets/vendor/TDSLoader.js');
+  const manager=new THREE.LoadingManager();
+  const textureReady=new Promise((resolve,reject)=>{manager.onLoad=resolve;manager.onError=url=>reject(new Error('No se pudo cargar '+url));});
+  manager.setURLModifier(url=>url.replace(/[^/\\]+\.tga$/i,name=>name.toLowerCase().replace(/\.tga$/,'.png')));
+  const loader=new TDSLoader(manager);
+  loader.setResourcePath(new URL('./assets/models/apollo13/textures/',location.href).href);
+  $('loadingText').textContent='Cargando el Saturn V y sus texturas…';
+  const [source]=await Promise.all([loader.loadAsync('./assets/models/apollo13/apollo13.3ds'),textureReady]);
+  source.updateMatrixWorld(true);
+  const sourceBounds=new THREE.Box3().setFromObject(source),center=sourceBounds.getCenter(new THREE.Vector3());
+  const sourceHeight=sourceBounds.max.z-sourceBounds.min.z,scale=23.7/sourceHeight;
+  if(!Number.isFinite(scale)||sourceHeight<=0)throw new Error('El modelo no tiene dimensiones válidas.');
+  const thirdSection=source.getObjectByName('a13sec3'),upperSection=source.getObjectByName('a13sec6'),coneSection=source.getObjectByName('a13cone');
+  if(!thirdSection||!upperSection||!coneSection)throw new Error('Faltan las secciones del Saturn V.');
+  const nativeCuts=[sourceBounds.min.z,new THREE.Box3().setFromObject(thirdSection).max.z,new THREE.Box3().setFromObject(upperSection).min.z,new THREE.Box3().setFromObject(coneSection).min.z,sourceBounds.max.z+.0001];
+  const cuts=nativeCuts.map(z=>(z-sourceBounds.min.z)*scale);
+  const parents=[s1,s2,s3,upperStack],convertedMaterials=new Map(),parts=[];
+  for(let i=0;i<parents.length;i++){
+    // Keep the animated engine plume; hide the former procedural body.
+    parents[i].children.forEach(child=>{if(child!==saturnFlames)child.visible=false;});
+    parents[i].position.y=cuts[i];
+  }
+  function materialFor(original){
+    if(convertedMaterials.has(original))return convertedMaterials.get(original);
+    if(original.map){original.map.colorSpace=THREE.SRGBColorSpace;original.map.wrapS=original.map.wrapT=THREE.RepeatWrapping;original.map.anisotropy=Math.min(8,renderer.capabilities.getMaxAnisotropy());original.map.needsUpdate=true;}
+    const metal=original.name==='apollexhst';
+    const material=new THREE.MeshStandardMaterial({name:original.name,map:original.map||null,color:original.color,metalness:metal?.65:.2,roughness:metal?.48:.64,side:original.side,transparent:original.transparent,opacity:original.opacity});
+    convertedMaterials.set(original,material);return material;
+  }
+  function mixVertex(a,b,t){return {p:a.p.clone().lerp(b.p,t),n:a.n.clone().lerp(b.n,t).normalize(),uv:a.uv.clone().lerp(b.uv,t)};}
+  function clipHeight(polygon,height,above){
+    const result=[];if(!polygon.length)return result;
+    const inside=v=>above?v.p.y>=height:v.p.y<=height;
+    for(let i=0;i<polygon.length;i++){
+      const a=polygon[i],b=polygon[(i+1)%polygon.length],aInside=inside(a),bInside=inside(b);
+      if(aInside)result.push(a);
+      if(aInside!==bInside){const delta=b.p.y-a.p.y;result.push(mixVertex(a,b,clamp((height-a.p.y)/delta,0,1)));}
+    }
+    return result;
+  }
+  source.traverse(original=>{
+    if(!original.isMesh)return;
+    const geometry=original.geometry.clone().applyMatrix4(original.matrixWorld);
+    const positions=geometry.attributes.position,normals=geometry.attributes.normal,uvs=geometry.attributes.uv,indices=geometry.index;
+    const material=materialFor(Array.isArray(original.material)?original.material[0]:original.material);
+    const buckets=parents.map(()=>({p:[],n:[],uv:[]}));
+    function vertex(index){
+      return {p:new THREE.Vector3((positions.getX(index)-center.x)*scale,(positions.getZ(index)-sourceBounds.min.z)*scale,-(positions.getY(index)-center.y)*scale),n:new THREE.Vector3(normals.getX(index),normals.getZ(index),-normals.getY(index)),uv:new THREE.Vector2(uvs?.getX(index)||0,uvs?.getY(index)||0)};
+    }
+    const total=indices?indices.count:positions.count;
+    for(let face=0;face<total;face+=3){
+      const triangle=[0,1,2].map(c=>vertex(indices?indices.getX(face+c):face+c));
+      const low=Math.min(...triangle.map(v=>v.p.y)),high=Math.max(...triangle.map(v=>v.p.y));
+      for(let stage=0;stage<parents.length;stage++){
+        if(high<cuts[stage]||low>cuts[stage+1])continue;
+        let polygon=clipHeight(triangle,cuts[stage],true);polygon=clipHeight(polygon,cuts[stage+1],false);
+        for(let j=1;j<polygon.length-1;j++)for(const v of [polygon[0],polygon[j],polygon[j+1]]){
+          const bucket=buckets[stage];bucket.p.push(v.p.x,v.p.y-cuts[stage],v.p.z);bucket.n.push(v.n.x,v.n.y,v.n.z);bucket.uv.push(v.uv.x,v.uv.y);
+        }
+      }
+    }
+    buckets.forEach((bucket,stage)=>{
+      if(!bucket.p.length)return;
+      const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.Float32BufferAttribute(bucket.p,3));g.setAttribute('normal',new THREE.Float32BufferAttribute(bucket.n,3));g.setAttribute('uv',new THREE.Float32BufferAttribute(bucket.uv,2));g.computeBoundingSphere();
+      const mesh=new THREE.Mesh(g,material);mesh.name=original.name+'_stage_'+stage;mesh.castShadow=true;mesh.receiveShadow=true;mesh.userData.suppliedSaturn=true;parents[stage].add(mesh);parts.push(mesh);
+    });
+    geometry.dispose();
+  });
+  if(!parts.length)throw new Error('No se encontraron piezas del cohete.');
+  // Positions measured from the five engine bells of the supplied mesh.
+  const nativeEngines=[[3.50215756,2.26051466],[-42.07728342,2.30386444],[3.50510957,46.81739912],[3.99480248,-41.17062147],[48.53193974,2.82338466]];
+  flameVisuals.forEach((flame,i)=>{const [x,y]=nativeEngines[i];flame.group.position.set((x-center.x)*scale,-.02,-(y-center.y)*scale);});
+  saturn.name='Saturn V — modelo suministrado';saturn.userData.suppliedModel=true;
+  return {parts,sourceHeight,scale,cuts,textureCount:[...convertedMaterials.values()].filter(m=>m.map).length};
+}
+let suppliedModelInfo;
+try {suppliedModelInfo=await installSuppliedSaturn();}
+catch(error){showLoadError('No se pudo cargar el modelo de Saturn V. Revisa tu conexión y vuelve a intentarlo.');throw error;}
 
 // ---------- BASE TRANSFORMS / RESETTABLE VISUAL STATE ----------
 const BASE_SCENE={
